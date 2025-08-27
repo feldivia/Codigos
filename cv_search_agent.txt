@@ -1,0 +1,609 @@
+import lancedb
+import numpy as np
+import pandas as pd
+import json
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import LanceDB
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.schema import Document
+from langchain.callbacks import StreamingStdOutCallbackHandler
+from langchain.schema.messages import SystemMessage, HumanMessage
+
+
+@dataclass
+class SearchConfig:
+    """Configuración para búsqueda vectorial"""
+    db_uri: str
+    table_name: str
+    openai_api_key: str
+    embedding_model: str = "text-embedding-ada-002"
+    llm_model: str = "gpt-4"
+    temperature: float = 0.3
+    top_k: int = 5
+
+
+class CVSearchAgent:
+    """
+    Agente especializado en búsqueda y análisis de curriculums
+    utilizando búsqueda vectorial en LanceDB
+    """
+    
+    def __init__(self, config: SearchConfig):
+        """
+        Inicializa el agente de búsqueda
+        
+        Args:
+            config: Configuración de búsqueda
+        """
+        self.config = config
+        
+        # Inicializar modelo de embeddings
+        self.embeddings = OpenAIEmbeddings(
+            openai_api_key=config.openai_api_key,
+            model=config.embedding_model
+        )
+        
+        # Inicializar LLM para el agente
+        self.llm = ChatOpenAI(
+            openai_api_key=config.openai_api_key,
+            model=config.llm_model,
+            temperature=config.temperature,
+            streaming=True,
+            callbacks=[StreamingStdOutCallbackHandler()]
+        )
+        
+        # Conectar a la base de datos
+        self.db = lancedb.connect(config.db_uri)
+        self.table = self.db.open_table(config.table_name)
+        
+        # Configurar prompts del agente
+        self._setup_prompts()
+    
+    def _setup_prompts(self):
+        """Configura los prompts del agente especialista en CVs"""
+        
+        self.system_template = """Eres un especialista experto en análisis de currículums y reclutamiento de talento tecnológico.
+Tu rol es analizar perfiles profesionales y proporcionar recomendaciones precisas basadas en los requisitos del usuario.
+
+Cuando analices los candidatos, considera:
+1. **Experiencia Técnica**: Habilidades, tecnologías y herramientas dominadas
+2. **Experiencia Profesional**: Roles, responsabilidades y logros
+3. **Educación y Certificaciones**: Formación académica y certificaciones relevantes
+4. **Industrias**: Sectores donde ha trabajado
+5. **Fit Cultural**: Basado en el tipo de empresas y proyectos previos
+
+Para cada candidato recomendado, proporciona:
+- Nombre completo y cargo actual
+- Resumen de por qué es relevante para la búsqueda
+- Principales fortalezas que lo hacen destacar
+- Experiencia específica relacionada con los requisitos
+- Nivel de coincidencia (Alto/Medio/Bajo) con explicación
+
+Sé específico y utiliza la información disponible de los CVs para justificar tus recomendaciones.
+Si no hay candidatos que cumplan bien con los criterios, sé honesto al respecto y sugiere alternativas."""
+
+        self.human_template = """Consulta del usuario: {query}
+
+Candidatos encontrados:
+{candidates}
+
+Por favor, analiza estos perfiles y proporciona recomendaciones detalladas basadas en la consulta."""
+    
+    def _format_candidate(self, record: pd.Series, score: float) -> str:
+        """
+        Formatea la información de un candidato para el análisis
+        
+        Args:
+            record: Registro del candidato
+            score: Puntaje de similitud
+            
+        Returns:
+            String formateado con la información del candidato
+        """
+        # Extraer metadata
+        metadata = {}
+        if 'metadata' in record and record['metadata']:
+            try:
+                metadata = json.loads(record['metadata'])
+            except:
+                pass
+        
+        # Construir información del candidato
+        candidate_info = []
+        candidate_info.append(f"**Candidato:** {record.get('nombres', 'N/A')} {record.get('apellido_paterno', '')} {record.get('apellido_materno', '')}")
+        candidate_info.append(f"**Email:** {metadata.get('email', record.get('email', 'N/A'))}")
+        candidate_info.append(f"**Cargo Actual:** {record.get('cargo', 'N/A')}")
+        candidate_info.append(f"**Línea de Servicio:** {record.get('los', 'N/A')} - {record.get('sublos', 'N/A')}")
+        candidate_info.append(f"**Similitud:** {score:.2%}")
+        
+        # Añadir antecedentes si existen
+        if record.get('antecedente'):
+            candidate_info.append(f"\n**Resumen Profesional:**\n{record['antecedente'][:500]}...")
+        
+        # Añadir habilidades
+        if record.get('habilidades'):
+            candidate_info.append(f"\n**Habilidades:**\n{record['habilidades'][:300]}...")
+        
+        # Añadir áreas de experiencia
+        if record.get('areas_experiencia'):
+            candidate_info.append(f"\n**Áreas de Experiencia:**\n{record['areas_experiencia'][:200]}...")
+        
+        # Añadir industrias
+        if record.get('industrias'):
+            candidate_info.append(f"\n**Industrias:**\n{record['industrias']}")
+        
+        # Añadir educación
+        if record.get('educacion'):
+            candidate_info.append(f"\n**Educación:**\n{record['educacion'][:300]}...")
+        
+        return "\n".join(candidate_info)
+    
+    def vector_search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Realiza búsqueda vectorial en la base de datos
+        
+        Args:
+            query: Consulta del usuario
+            top_k: Número de resultados a retornar
+            
+        Returns:
+            Lista de candidatos encontrados con sus scores
+        """
+        if top_k is None:
+            top_k = self.config.top_k
+        
+        print(f"\n🔍 Realizando búsqueda vectorial para: '{query}'")
+        print("-" * 60)
+        
+        # Generar embedding de la consulta
+        query_embedding = self.embeddings.embed_query(query)
+        query_vector = np.array(query_embedding)
+        
+        # Obtener todos los registros
+        records_df = self.table.to_pandas()
+        
+        # Calcular similitudes
+        similarities = []
+        
+        for idx in records_df.index:
+            # Obtener vector del registro
+            record_vector = np.array(records_df.loc[idx, 'vector'])
+            
+            # Calcular similitud coseno
+            cosine_sim = np.dot(query_vector, record_vector) / (
+                np.linalg.norm(query_vector) * np.linalg.norm(record_vector)
+            )
+            
+            similarities.append({
+                'index': idx,
+                'score': float(cosine_sim),
+                'record': records_df.loc[idx]
+            })
+        
+        # Ordenar por similitud y tomar top_k
+        similarities.sort(key=lambda x: x['score'], reverse=True)
+        top_results = similarities[:top_k]
+        
+        print(f"✅ Encontrados {len(similarities)} candidatos")
+        print(f"📊 Retornando top {len(top_results)} resultados\n")
+        
+        return top_results
+    
+    def search_and_analyze(self, query: str, top_k: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Realiza búsqueda vectorial y análisis con el agente LLM
+        
+        Args:
+            query: Consulta del usuario sobre perfiles buscados
+            top_k: Número de resultados a analizar
+            
+        Returns:
+            Diccionario con resultados y análisis del agente
+        """
+        if top_k is None:
+            top_k = self.config.top_k
+        
+        print("="*80)
+        print("🤖 AGENTE ESPECIALISTA EN CURRÍCULUMS")
+        print("="*80)
+        
+        # Realizar búsqueda vectorial
+        search_results = self.vector_search(query, top_k)
+        
+        if not search_results:
+            return {
+                'query': query,
+                'candidates': [],
+                'analysis': "No se encontraron candidatos que coincidan con la búsqueda."
+            }
+        
+        # Formatear candidatos para el análisis
+        formatted_candidates = []
+        for i, result in enumerate(search_results, 1):
+            print(f"\n📋 Candidato {i}:")
+            print("-" * 40)
+            formatted = self._format_candidate(result['record'], result['score'])
+            print(formatted[:500] + "...\n")
+            formatted_candidates.append(f"\n--- CANDIDATO {i} ---\n{formatted}")
+        
+        candidates_text = "\n".join(formatted_candidates)
+        
+        # Ejecutar análisis con el agente usando el método invoke
+        print("="*80)
+        print("🔍 ANÁLISIS DEL ESPECIALISTA")
+        print("="*80)
+        print("\n")
+        
+        # Crear mensajes para el LLM
+        messages = [
+            SystemMessage(content=self.system_template),
+            HumanMessage(content=self.human_template.format(
+                query=query,
+                candidates=candidates_text
+            ))
+        ]
+        
+        # Invocar el LLM con los mensajes
+        response = self.llm.invoke(messages)
+        analysis = response.content
+        
+        # Preparar respuesta estructurada
+        response = {
+            'query': query,
+            'total_candidates': len(search_results),
+            'candidates': [
+                {
+                    'name': f"{r['record'].get('nombres', '')} {r['record'].get('apellido_paterno', '')}".strip(),
+                    'email': r['record'].get('email', ''),
+                    'position': r['record'].get('cargo', ''),
+                    'score': r['score'],
+                    'summary': r['record'].get('antecedente', '')[:200] if r['record'].get('antecedente') else ''
+                }
+                for r in search_results
+            ],
+            'analysis': analysis
+        }
+        
+        print("\n" + "="*80)
+        print("✅ Análisis completado")
+        print("="*80)
+        
+        return response
+
+
+class CVSearchAgentWithMemory(CVSearchAgent):
+    """
+    Agente de búsqueda con memoria de conversación
+    Extiende CVSearchAgent para mantener contexto entre mensajes
+    """
+    
+    def __init__(self, config: SearchConfig, memory_size: int = 10):
+        """
+        Inicializa el agente con memoria
+        
+        Args:
+            config: Configuración de búsqueda
+            memory_size: Número máximo de mensajes a recordar
+        """
+        super().__init__(config)
+        self.memory_size = memory_size
+        self.conversation_memory = deque(maxlen=memory_size * 2)  # *2 para pares user/assistant
+        self.last_search_results = None
+        self.context_aware = True
+    
+    def add_to_memory(self, role: str, content: str):
+        """
+        Añade un mensaje a la memoria
+        
+        Args:
+            role: 'user' o 'assistant'
+            content: Contenido del mensaje
+        """
+        if role == "user":
+            self.conversation_memory.append(HumanMessage(content=content))
+        else:
+            self.conversation_memory.append(AIMessage(content=content))
+    
+    def get_conversation_context(self) -> str:
+        """
+        Obtiene el contexto de la conversación previa
+        
+        Returns:
+            String con el contexto relevante
+        """
+        if not self.conversation_memory:
+            return ""
+        
+        context_parts = []
+        for msg in self.conversation_memory:
+            if isinstance(msg, HumanMessage):
+                context_parts.append(f"Usuario: {msg.content[:200]}...")
+            elif isinstance(msg, AIMessage):
+                context_parts.append(f"Asistente: {msg.content[:200]}...")
+        
+        return "\n".join(context_parts[-6:])  # Últimos 6 mensajes para contexto
+    
+    def clear_memory(self):
+        """Limpia la memoria de conversación"""
+        self.conversation_memory.clear()
+        self.last_search_results = None
+    
+    def search_with_context(self, query: str, top_k: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Realiza búsqueda considerando el contexto de la conversación
+        
+        Args:
+            query: Nueva consulta del usuario
+            top_k: Número de resultados
+            
+        Returns:
+            Diccionario con resultados y análisis contextualizado
+        """
+        if top_k is None:
+            top_k = self.config.top_k
+        
+        # Añadir query del usuario a la memoria
+        self.add_to_memory("user", query)
+        
+        # Determinar si es una pregunta de seguimiento o nueva búsqueda
+        is_followup = self._is_followup_question(query)
+        
+        if is_followup and self.last_search_results:
+            # Usar resultados anteriores para responder pregunta de seguimiento
+            response = self._answer_followup(query, self.last_search_results)
+        else:
+            # Realizar nueva búsqueda
+            print("="*80)
+            print("🤖 AGENTE ESPECIALISTA EN CURRÍCULUMS (Con Memoria)")
+            print("="*80)
+            
+            # Obtener contexto de conversación
+            context = self.get_conversation_context()
+            
+            # Enriquecer la query con contexto si es relevante
+            enhanced_query = self._enhance_query_with_context(query, context)
+            
+            # Realizar búsqueda vectorial
+            search_results = self.vector_search(enhanced_query, top_k)
+            
+            if not search_results:
+                response = {
+                    'query': query,
+                    'candidates': [],
+                    'analysis': "No se encontraron candidatos que coincidan con la búsqueda."
+                }
+            else:
+                # Guardar resultados para posibles preguntas de seguimiento
+                self.last_search_results = search_results
+                
+                # Formatear candidatos
+                formatted_candidates = []
+                for i, result in enumerate(search_results, 1):
+                    formatted = self._format_candidate(result['record'], result['score'])
+                    formatted_candidates.append(f"\n--- CANDIDATO {i} ---\n{formatted}")
+                
+                candidates_text = "\n".join(formatted_candidates)
+                
+                # Análisis con contexto de conversación
+                print("="*80)
+                print("🔍 ANÁLISIS CONTEXTUALIZADO")
+                print("="*80)
+                
+                # Crear prompt con contexto
+                system_content = self.system_template
+                if context:
+                    system_content += f"\n\nContexto de conversación previa:\n{context}\n\nConsidera este contexto al analizar los nuevos candidatos."
+                
+                messages = [
+                    SystemMessage(content=system_content),
+                    HumanMessage(content=self.human_template.format(
+                        query=query,
+                        candidates=candidates_text
+                    ))
+                ]
+                
+                # Invocar LLM
+                llm_response = self.llm.invoke(messages)
+                analysis = llm_response.content
+                
+                response = {
+                    'query': query,
+                    'enhanced_query': enhanced_query,
+                    'total_candidates': len(search_results),
+                    'candidates': [
+                        {
+                            'name': f"{r['record'].get('nombres', '')} {r['record'].get('apellido_paterno', '')}".strip(),
+                            'email': r['record'].get('email', ''),
+                            'position': r['record'].get('cargo', ''),
+                            'score': r['score'],
+                            'summary': r['record'].get('antecedente', '')[:200] if r['record'].get('antecedente') else ''
+                        }
+                        for r in search_results
+                    ],
+                    'analysis': analysis,
+                    'is_followup': False
+                }
+        
+        # Añadir respuesta a la memoria
+        self.add_to_memory("assistant", response.get('analysis', ''))
+        
+        print("\n" + "="*80)
+        print("✅ Análisis completado")
+        print("="*80)
+        
+        return response
+    
+    def _is_followup_question(self, query: str) -> bool:
+        """
+        Determina si la pregunta es de seguimiento sobre resultados anteriores
+        
+        Args:
+            query: Pregunta del usuario
+            
+        Returns:
+            True si es pregunta de seguimiento
+        """
+        followup_indicators = [
+            "más información", "más detalles", "cuál de ellos", "el primero",
+            "el segundo", "el tercero", "ese candidato", "esos candidatos",
+            "alguno de ellos", "comparar", "diferencias entre", "mejor opción",
+            "más sobre", "experiencia de", "habilidades de", "contacto de"
+        ]
+        
+        query_lower = query.lower()
+        
+        # Verificar si hay resultados previos y si la query contiene indicadores
+        if self.last_search_results:
+            for indicator in followup_indicators:
+                if indicator in query_lower:
+                    return True
+        
+        return False
+    
+    def _enhance_query_with_context(self, query: str, context: str) -> str:
+        """
+        Enriquece la query con contexto relevante de la conversación
+        
+        Args:
+            query: Query original
+            context: Contexto de conversación
+            
+        Returns:
+            Query enriquecida
+        """
+        # Si no hay contexto relevante, retornar query original
+        if not context or len(self.conversation_memory) < 2:
+            return query
+        
+        # Analizar si el contexto añade información útil
+        context_keywords = []
+        for msg in list(self.conversation_memory)[-4:]:  # Últimos 4 mensajes
+            if isinstance(msg, HumanMessage):
+                # Extraer palabras clave del contexto
+                words = msg.content.lower().split()
+                for word in words:
+                    if len(word) > 4 and word not in query.lower():
+                        context_keywords.append(word)
+        
+        # Si hay palabras clave relevantes, considerar añadirlas
+        if context_keywords:
+            # Por ahora, retornamos la query original
+            # En una versión más avanzada, podríamos usar NLP para mejorar esto
+            return query
+        
+        return query
+    
+    def _answer_followup(self, query: str, previous_results: List[Dict]) -> Dict[str, Any]:
+        """
+        Responde preguntas de seguimiento sobre resultados anteriores
+        
+        Args:
+            query: Pregunta de seguimiento
+            previous_results: Resultados de búsqueda anteriores
+            
+        Returns:
+            Respuesta contextualizada
+        """
+        print("="*80)
+        print("💬 PREGUNTA DE SEGUIMIENTO")
+        print("="*80)
+        
+        # Formatear candidatos anteriores
+        formatted_candidates = []
+        for i, result in enumerate(previous_results, 1):
+            formatted = self._format_candidate(result['record'], result['score'])
+            formatted_candidates.append(f"\n--- CANDIDATO {i} ---\n{formatted}")
+        
+        candidates_text = "\n".join(formatted_candidates)
+        
+        # Crear prompt para pregunta de seguimiento
+        followup_system = """Eres un especialista en reclutamiento respondiendo una pregunta de seguimiento 
+sobre candidatos ya presentados. Proporciona información específica y detallada basándote en los datos disponibles.
+Si la pregunta requiere información que no está disponible, indícalo claramente."""
+        
+        followup_human = f"""Pregunta de seguimiento: {query}
+
+Candidatos previamente mostrados:
+{candidates_text}
+
+Por favor, responde la pregunta basándote en la información de estos candidatos."""
+        
+        messages = [
+            SystemMessage(content=followup_system),
+            HumanMessage(content=followup_human)
+        ]
+        
+        # Obtener respuesta
+        llm_response = self.llm.invoke(messages)
+        
+        return {
+            'query': query,
+            'total_candidates': len(previous_results),
+            'candidates': [
+                {
+                    'name': f"{r['record'].get('nombres', '')} {r['record'].get('apellido_paterno', '')}".strip(),
+                    'email': r['record'].get('email', ''),
+                    'position': r['record'].get('cargo', ''),
+                    'score': r['score'],
+                    'summary': r['record'].get('antecedente', '')[:200] if r['record'].get('antecedente') else ''
+                }
+                for r in previous_results
+            ],
+            'analysis': llm_response.content,
+            'is_followup': True
+        }
+
+
+def quick_search(
+    query: str,
+    db_uri: str,
+    table_name: str,
+    openai_api_key: str,
+    top_k: int = 5
+) -> Dict[str, Any]:
+    """
+    Función rápida para realizar búsquedas sin instanciar la clase
+    
+    Args:
+        query: Consulta del usuario
+        db_uri: URI de la base de datos
+        table_name: Nombre de la tabla
+        openai_api_key: API Key de OpenAI
+        top_k: Número de resultados
+        
+    Returns:
+        Diccionario con resultados y análisis
+    """
+    config = SearchConfig(
+        db_uri=db_uri,
+        table_name=table_name,
+        openai_api_key=openai_api_key,
+        top_k=top_k
+    )
+    
+    agent = CVSearchAgent(config)
+    return agent.search_and_analyze(query, top_k)
+
+
+# Ejemplo de uso
+if __name__ == "__main__":
+    # Configuración
+    config = SearchConfig(
+        db_uri="./data/target_db",
+        table_name="personal_embeddings",
+        openai_api_key="sk-...",  # Tu API key
+        llm_model="gpt-4",
+        temperature=0.3,
+        top_k=5
+    )
+    
+    # Crear agente
+    agent = CVSearchAgent(config)
+    
+    # Ejemplo de búsqueda general
+    result = agent.search_and_analyze(
+        "Necesito un desarrollador Python con experiencia en IA y machine learning"
+    )
