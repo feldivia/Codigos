@@ -177,7 +177,13 @@ def display_candidates(candidates: List[Dict[str, Any]]):
                         help="Agregar candidato a la lista de seleccionados",
                         use_container_width=True
                     ):
-                        add_to_cart(candidate)
+                        # Verificar si ya está en el carrito
+                        if not any(c.get('email') == candidate.get('email') for c in st.session_state.shopping_cart):
+                            st.session_state.shopping_cart.append(candidate)
+                            st.success(f"✅ {candidate.get('name', 'Candidato')} agregado")
+                            st.rerun()
+                        else:
+                            st.warning(f"⚠️ {candidate.get('name', 'Candidato')} ya está en la selección")
                 
                 with button_cols[1]:
                     # Botón para ver más información
@@ -187,24 +193,10 @@ def display_candidates(candidates: List[Dict[str, Any]]):
                         help="Ver información detallada del candidato",
                         use_container_width=True
                     ):
-                        show_candidate_details(candidate)
+                        st.session_state.show_candidate_details = candidate
+                        st.rerun()
                 
                 st.markdown("---")
-
-
-def add_to_cart(candidate: Dict[str, Any]):
-    """Agrega un candidato al carrito de selección"""
-    # Verificar si ya está en el carrito
-    if not any(c.get('email') == candidate.get('email') for c in st.session_state.shopping_cart):
-        st.session_state.shopping_cart.append(candidate)
-        st.success(f"✅ {candidate.get('name', 'Candidato')} agregado a la selección")
-    else:
-        st.warning(f"⚠️ {candidate.get('name', 'Candidato')} ya está en la selección")
-
-
-def show_candidate_details(candidate: Dict[str, Any]):
-    """Muestra información detallada del candidato en un modal"""
-    st.session_state.show_candidate_details = candidate
 
 
 def display_candidate_modal():
@@ -212,40 +204,59 @@ def display_candidate_modal():
     if st.session_state.show_candidate_details:
         candidate = st.session_state.show_candidate_details
         
-        # Crear un expander que actúa como modal
-        with st.expander(f"📋 Información Detallada - {candidate.get('name', 'N/A')}", expanded=True):
-            col1, col2 = st.columns([3, 1])
+        # Crear un contenedor para el modal
+        st.markdown("---")
+        st.markdown("### 📋 Información Detallada del Candidato")
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            st.markdown(f"#### {candidate.get('name', 'N/A')}")
+            st.markdown(f"**Cargo:** {candidate.get('position', 'N/A')}")
+            st.markdown(f"**Email:** {candidate.get('email', 'N/A')}")
+            st.markdown(f"**Score de Coincidencia:** {candidate.get('score', 0)*100:.1f}%")
             
-            with col1:
-                st.markdown(f"### {candidate.get('name', 'N/A')}")
-                st.markdown(f"**Cargo:** {candidate.get('position', 'N/A')}")
-                st.markdown(f"**Email:** {candidate.get('email', 'N/A')}")
-                st.markdown(f"**Score de Coincidencia:** {candidate.get('score', 0)*100:.1f}%")
-                
-                if candidate.get('summary'):
-                    st.markdown("#### 📝 Resumen Profesional")
-                    st.text_area("", value=candidate.get('summary', ''), height=150, disabled=True)
-                
-                # Solicitar más información al agente
-                if st.button("🤖 Solicitar análisis detallado"):
-                    query = f"Dame más información detallada sobre el candidato {candidate.get('name', '')} con email {candidate.get('email', '')}"
-                    # Simular envío de mensaje
-                    st.session_state.messages.append({
-                        "role": "user",
-                        "content": query,
-                        "timestamp": datetime.now().strftime("%H:%M")
-                    })
+            if candidate.get('summary'):
+                st.markdown("**📝 Resumen Profesional:**")
+                st.info(candidate.get('summary', ''))
+        
+        with col2:
+            st.markdown("#### Acciones")
+            
+            # Botón para agregar al carrito
+            if st.button("🛒 Agregar a selección", key="modal_add", use_container_width=True):
+                if not any(c.get('email') == candidate.get('email') for c in st.session_state.shopping_cart):
+                    st.session_state.shopping_cart.append(candidate)
+                    st.success(f"✅ Agregado a la selección")
+                    # Limpiar el modal después de agregar
                     st.session_state.show_candidate_details = None
                     st.rerun()
+                else:
+                    st.warning(f"⚠️ Ya está en la selección")
             
-            with col2:
-                st.markdown("### Acciones")
-                if st.button("🛒 Agregar a selección", use_container_width=True):
-                    add_to_cart(candidate)
+            # Botón para solicitar más información
+            if st.button("🤖 Análisis detallado", key="modal_analyze", use_container_width=True):
+                # Preparar la consulta para el agente
+                query = f"Dame información más detallada sobre el candidato {candidate.get('name', '')} con email {candidate.get('email', '')}. Analiza sus fortalezas, experiencia y por qué sería un buen candidato."
                 
-                if st.button("❌ Cerrar", use_container_width=True):
-                    st.session_state.show_candidate_details = None
-                    st.rerun()
+                # Añadir a los mensajes
+                timestamp = datetime.now().strftime("%H:%M")
+                st.session_state.messages.append({
+                    "role": "user",
+                    "content": query,
+                    "timestamp": timestamp
+                })
+                
+                # Limpiar el modal
+                st.session_state.show_candidate_details = None
+                st.rerun()
+            
+            # Botón para cerrar
+            if st.button("❌ Cerrar", key="modal_close", use_container_width=True):
+                st.session_state.show_candidate_details = None
+                st.rerun()
+        
+        st.markdown("---")
 
 
 def sidebar_configuration():
@@ -413,11 +424,11 @@ def main():
     
     st.divider()
     
+    # Mostrar modal de detalles si está activo (antes del chat)
+    display_candidate_modal()
+    
     # Contenedor principal del chat
     chat_container = st.container()
-    
-    # Mostrar modal de detalles si está activo
-    display_candidate_modal()
     
     # Mostrar historial de mensajes
     with chat_container:
