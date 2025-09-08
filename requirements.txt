@@ -1,0 +1,25 @@
+# Dependencias para migración LanceDB con embeddings
+
+# LanceDB - Base de datos vectorial
+lancedb>=0.5.0
+
+# LangChain - Framework para LLMs y embeddings
+langchain>=0.1.0
+langchain-openai>=0.0.5
+
+# OpenAI - Para generar embeddings
+openai>=1.0.0
+
+# PyArrow - Manejo de schemas y datos
+pyarrow>=14.0.0
+
+# Pandas - Manipulación de datos
+pandas>=2.0.0
+
+# Python-dotenv - Para variables de entorno (opcional pero recomendado)
+python-dotenv>=1.0.0
+
+langgraph
+langchain-core 
+pydantic 
+httpx
