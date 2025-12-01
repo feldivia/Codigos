@@ -1,0 +1,22 @@
+# Requirements para el módulo de procesamiento de documentos
+# ============================================================
+
+# Procesamiento de PDF
+pdfplumber>=0.10.0          # Extracción de texto y tablas de PDF (mejor calidad)
+pypdf>=4.0.0                # Operaciones básicas con PDF y metadatos
+
+# Procesamiento de Word
+python-docx>=1.1.0          # Lectura y escritura de documentos Word (.docx)
+
+# Procesamiento de PowerPoint
+python-pptx>=0.6.23         # Lectura y escritura de presentaciones PowerPoint (.pptx)
+
+# Streamlit (framework de la aplicación)
+streamlit>=1.30.0
+
+# Utilidades
+pandas>=2.0.0               # Manipulación de datos y tablas
+
+# Opcional: OCR para PDFs escaneados (descomentar si se necesita)
+# pytesseract>=0.3.10       # OCR con Tesseract
+# pdf2image>=1.16.3         # Conversión de PDF a imagen para OCR
